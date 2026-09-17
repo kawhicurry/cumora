@@ -113,9 +113,27 @@ const RUN_HEARTBEAT_MS = 60_000
 // Fallback inbox drain. The wake-stream SSE can be silently severed by the
 // network edge (the server writes the wake onto a half-dead socket, counts it
 // delivered, and does nothing more), so a live wake can be lost until the daemon
-// detects the drop and reconnects. This low-frequency self-drain bounds catch-up
-// latency regardless of SSE health; an empty inbox makes the turn a cheap no-op.
+// detects the drop and reconnects. This self-drain bounds catch-up latency
+// regardless of SSE health; an empty inbox makes the turn a cheap no-op for the
+// DAEMON — but not for the server: every drain is a loadInbox against Postgres,
+// and at fleet scale (thousands of idle agents × one drain per 20s) that alone
+// pegged Cloud SQL. So the tick stays at 20s, but a tick only drains when the
+// stream is not provably alive (see fallbackPollDue): the server writes a
+// `: ping` comment every 25s (wake-bus.ts), so a stream silent for three pings
+// counts as dead and is polled at the old cadence AND torn down so streamLoop
+// reconnects (a half-dead socket can otherwise sit "open" for many minutes);
+// a stream that is demonstrably alive is trusted and only double-checked every
+// INBOX_POLL_STREAM_HEALTHY_MS.
 const INBOX_POLL_MS = 20_000
+const INBOX_POLL_STREAM_HEALTHY_MS = 120_000
+const WAKE_STREAM_STALE_MS = 75_000
+// Idle-tick `avail` reassert. Every idle drain used to POST /status {avail} —
+// an UPDATE + Redis publish per agent per tick that changed nothing. The server
+// now no-ops an avail→avail write, but the request itself (and its resolveDevice)
+// still costs; so the daemon posts avail only when the last status it sent was
+// something else, and re-asserts it this often as self-healing in case the
+// server-side row drifted (a failed post, a restore from backup, ...).
+const AVAIL_REASSERT_MS = 10 * 60_000
 // Pre-turn wake debounce. The FIRST wake from
 // an idle state arms this timer; wakes arriving within the window FOLD INTO it —
 // the turn snapshots ALL unread, so a burst of group messages becomes ONE big-
@@ -647,6 +665,27 @@ async function runtimeGet<T>(
     })
     return res.ok ? await res.json().catch(() => null) as T | null : null
   } catch { return null }
+}
+
+/** Should this 20s fallback tick actually drain the inbox?
+ *
+ *  Yes when the wake-stream is not provably alive: never connected, or silent
+ *  (no event, no `: ping`) for WAKE_STREAM_STALE_MS. Otherwise the stream is
+ *  trusted to deliver wakes and the drain runs only as a slow double-check,
+ *  every INBOX_POLL_STREAM_HEALTHY_MS since the last drain. `streamLastSeenAt`
+ *  is null while disconnected. Exported for tests — pure. */
+export function fallbackPollDue(input: {
+  now: number
+  streamLastSeenAt: number | null
+  lastInboxDrainAt: number
+  staleMs?: number
+  healthyIntervalMs?: number
+}): boolean {
+  const staleMs = input.staleMs ?? WAKE_STREAM_STALE_MS
+  const healthyIntervalMs = input.healthyIntervalMs ?? INBOX_POLL_STREAM_HEALTHY_MS
+  const streamAlive = input.streamLastSeenAt !== null && input.now - input.streamLastSeenAt < staleMs
+  if (!streamAlive) return true
+  return input.now - input.lastInboxDrainAt >= healthyIntervalMs
 }
 
 /** Which conversation should show "<agent> is typing…" for this turn.
@@ -1711,6 +1750,17 @@ export class AgentRunner {
   private lastGroupSteeredMsgId: string | null = null
   private lastGroupSteerAt = 0
   private pollTimer: ReturnType<typeof setInterval> | undefined
+  /** Wake-stream liveness for fallbackPollDue: when the stream last showed
+   *  signs of life (connect, any event, any `: ping`); null while disconnected. */
+  private streamLastSeenAt: number | null = null
+  /** Aborts the current wake-stream fetch, so a stream that has gone silent can
+   *  be torn down and reconnected instead of waiting for TCP to notice. */
+  private streamAbort: AbortController | null = null
+  /** When snapshotUnread last hit /inbox — the anchor for the slow double-check. */
+  private lastInboxDrainAt = 0
+  /** The last status POST that succeeded, and when — see AVAIL_REASSERT_MS. */
+  private lastPostedStatus: string | null = null
+  private lastPostedStatusAt = 0
   private readonly adapter
   /** Privileged local broker: the engine sees only its IPC directory, while the
    *  daemon keeps the short-lived runtime JWT in memory. */
@@ -1959,10 +2009,36 @@ export class AgentRunner {
     await this.cliBroker.start()
     await this.loadSessionId()
     void this.streamLoop()
-    // SSE-independent safety net (see INBOX_POLL_MS): drain the inbox on a slow
-    // tick so a wake lost to a half-dead stream is still picked up within the
-    // interval. Skip while busy so it never piles on the live turn.
-    this.pollTimer = setInterval(() => { if (!this.busy && !this.stopped) this.scheduleWake('poll') }, INBOX_POLL_MS)
+    // SSE-independent safety net (see INBOX_POLL_MS): tick every 20s, but only
+    // drain when the wake-stream can't be trusted (or the slow double-check is
+    // due), so a fleet of idle agents stops hammering /inbox in lockstep. Skip
+    // while busy so it never piles on the live turn.
+    this.pollTimer = setInterval(() => {
+      if (this.busy || this.stopped) return
+      const now = Date.now()
+      // A connected stream that has missed three pings is half-dead: tear it
+      // down so streamLoop reconnects (and its reconnect-catchup drains).
+      if (this.streamLastSeenAt !== null && now - this.streamLastSeenAt >= WAKE_STREAM_STALE_MS && this.streamAbort) {
+        console.warn(`[computer] ${this.agent.id} wake-stream silent for ${Math.round((now - this.streamLastSeenAt) / 1000)}s — reconnecting`)
+        this.streamAbort.abort()
+      }
+      if (fallbackPollDue({ now, streamLastSeenAt: this.streamLastSeenAt, lastInboxDrainAt: this.lastInboxDrainAt })) {
+        this.scheduleWake('poll')
+      }
+    }, INBOX_POLL_MS)
+  }
+
+  /** POST /status, skipping an idle `avail` the server already holds. Any other
+   *  status (thinking, resting…) always posts, and the avail right after it
+   *  posts too — only avail-after-avail is elided, and even that is re-asserted
+   *  every AVAIL_REASSERT_MS. A failed post is not remembered, so the next tick
+   *  retries it. */
+  private async postStatus(token: string, status: 'avail' | 'thinking'): Promise<void> {
+    const now = Date.now()
+    if (status === 'avail' && this.lastPostedStatus === 'avail' && now - this.lastPostedStatusAt < AVAIL_REASSERT_MS) return
+    const ok = await runtimeBest(this.cfg.serverUrl, '/status', token, { status })
+    if (ok) { this.lastPostedStatus = status; this.lastPostedStatusAt = now }
+    else this.lastPostedStatus = null
   }
 
   /** Phase 1 of shutdown: stop accepting NEW wakes/turns, but leave any in-flight
@@ -1970,6 +2046,7 @@ export class AgentRunner {
   beginStop(): void {
     this.stopped = true
     if (this.pollTimer) { clearInterval(this.pollTimer); this.pollTimer = undefined }
+    this.streamAbort?.abort()
     if (this.wakeDebounceTimer) { clearTimeout(this.wakeDebounceTimer); this.wakeDebounceTimer = null }
   }
 
@@ -2399,6 +2476,7 @@ export class AgentRunner {
   }
 
   private async snapshotUnread(token: string): Promise<{ seen: Map<string, string>; digest: string; hasReal: boolean; projectIds: string[] }> {
+    this.lastInboxDrainAt = Date.now()
     const inbox = await runtimeGet<RuntimeInboxResponse>(this.cfg.serverUrl, '/inbox', token)
     const seen = new Map<string, string>()
     // Unread grouped BY CONVERSATION (first-seen order), each with the header
@@ -2652,7 +2730,7 @@ export class AgentRunner {
     )
     if (!ag?.actionable || !ag.brief) return
     console.log(`[computer] ${this.agent.id} agenda turn START — proactive board work${ag.focus ? `: ${ag.focus.slice(0, 80)}` : ''}`)
-    await runtimeBest(this.cfg.serverUrl, '/status', token, { status: 'thinking' })
+    await this.postStatus(token, 'thinking')
     const run = (await runtimeBest(this.cfg.serverUrl, '/runs', token, {
       trigger: { source: 'byoa-agenda', engine: this.adapter.id },
     })) as { runId?: string } | null
@@ -2697,7 +2775,7 @@ export class AgentRunner {
       // wraps because a slow flush must not block the chat path.
       this.currentRunId = null
       void this.reporter.flush()
-      await runtimeBest(this.cfg.serverUrl, '/status', token, { status: 'avail' })
+      await this.postStatus(token, 'avail')
       // Mirror chat path: release the concurrency slot regardless of outcome.
       bigBrainSem.release()
     }
@@ -2911,7 +2989,7 @@ export class AgentRunner {
         // dropping that SSE payload here was why BYOA cards stayed in Todo.
         if (!wakeHasActionableInput(hasReal, activeBackgroundBrief)) {
           await this.ackSeen(token, seen)
-          await runtimeBest(this.cfg.serverUrl, '/status', token, { status: 'avail' })
+          await this.postStatus(token, 'avail')
           // No per-tick log: this is the idle steady state (every poll × agent),
           // same reasoning as the 'inbox empty' skip below.
           // Chat is idle → maybe there's assigned BOARD work to proactively pick up
@@ -2934,7 +3012,7 @@ export class AgentRunner {
           const backoff = Math.min(10 * 60_000, 30_000 * 2 ** (this.triageTroubleStreak - 1))
           this.triageBackoffUntil = Date.now() + backoff
           console.warn(`[computer] ${this.agent.id} triage RATE-LIMITED (#${this.triageTroubleStreak}, triage ${triageMs}ms) — backing off ${Math.round(backoff / 1000)}s, NOT waking the big brain, not acking`)
-          await runtimeBest(this.cfg.serverUrl, '/status', token, { status: 'avail' })
+          await this.postStatus(token, 'avail')
           break
         }
         // FAIL-OPEN is a triage FAILURE, not a confirmed real task — so it must
@@ -2947,7 +3025,7 @@ export class AgentRunner {
           const backoff = Math.min(10 * 60_000, 30_000 * 2 ** (this.triageTroubleStreak - 1))
           this.triageBackoffUntil = Date.now() + backoff
           console.warn(`[computer] ${this.agent.id} triage FAIL-OPEN (#${this.triageTroubleStreak}, triage ${triageMs}ms) — NOT waking the big brain, backing off ${Math.round(backoff / 1000)}s, not acking`)
-          await runtimeBest(this.cfg.serverUrl, '/status', token, { status: 'avail' })
+          await this.postStatus(token, 'avail')
           break
         }
         // A clean, usable triage clears any prior backoff.
@@ -2965,7 +3043,7 @@ export class AgentRunner {
           // unread sticks and the INBOX_POLL_MS drain re-triages it forever —
           // the loop that woke (or nearly woke) the big brain on every tick.
           await this.ackSeen(token, seen)
-          await runtimeBest(this.cfg.serverUrl, '/status', token, { status: 'avail' })
+          await this.postStatus(token, 'avail')
           // Chat had nothing for us → maybe proactively pick up assigned board work.
           await this.maybeAgendaTurn(token)
           continue
@@ -2984,7 +3062,7 @@ export class AgentRunner {
           ? `manual brief ${activeBackgroundBrief.source ?? 'unknown'}`
           : `triage ${triageMs}ms`
         console.log(`[computer] ${this.agent.id} turn START (${reason}) — ${gateLabel}, spawning ${this.adapter.id}${convo ? ` for ${convo}` : ''}`)
-        await runtimeBest(this.cfg.serverUrl, '/status', token, { status: 'thinking' })
+        await this.postStatus(token, 'thinking')
         // "<agent> is typing…" in the conversation that woke us, refreshed
         // while the engine works (BYOA runs can be long), cleared at the end.
         let typingTimer: ReturnType<typeof setInterval> | undefined
@@ -3158,7 +3236,7 @@ export class AgentRunner {
         // from re-waking the big brain on the next drain. On engine FAILURE we
         // skip the ack so the unread survives for a retry / next wake.
         if (!engineError) await this.ackSeen(token, seen)
-        await runtimeBest(this.cfg.serverUrl, '/status', token, { status: 'avail' })
+        await this.postStatus(token, 'avail')
         // A chat turn resets the "quiet" anchor: an agent that just acted in chat
         // isn't immediately pulled into an agenda turn (mirrors the cloud idle
         // scheduler only picking agents quiet for N minutes).
@@ -3192,10 +3270,13 @@ export class AgentRunner {
     let backoff = 1000
     while (!this.stopped) {
       let connectedAt: number | null = null
+      const abort = new AbortController()
+      this.streamAbort = abort
       try {
         const token = await this.ensureToken()
         const res = await fetch(`${this.cfg.serverUrl}/runtime/wake-stream`, {
           headers: { Authorization: `Bearer ${token}`, Accept: 'text/event-stream' },
+          signal: abort.signal,
         })
         if (!res.ok || !res.body) {
           if (res.status === 401 || res.status === 403) this.invalidateToken(token)
@@ -3203,8 +3284,13 @@ export class AgentRunner {
         }
         console.log(`[computer] ${this.agent.id} wake-stream connected (engine: ${this.adapter.id})`)
         connectedAt = Date.now()
+        this.streamLastSeenAt = connectedAt
         this.kickTurn('reconnect-catchup') // cold-start / reconnect catch-up
-        for await (const evt of parseSseStream(res.body as unknown as AsyncIterable<unknown>)) {
+        // Every event AND every `: ping` comment is proof the stream is alive;
+        // the fallback poll (fallbackPollDue) keys off this timestamp.
+        const alive = (): void => { this.streamLastSeenAt = Date.now() }
+        for await (const evt of parseSseStream(res.body as unknown as AsyncIterable<unknown>, { onComment: alive })) {
+          alive()
           if (this.stopped) break
           if (evt.event === 'wake' || evt.event === 'steer') {
             // 'wake': normal new-activity nudge. 'steer': a peer posted while we
@@ -3243,6 +3329,8 @@ export class AgentRunner {
         const _cause = (err as { cause?: { code?: string; message?: string } } | null)?.cause
         console.warn(`[computer] ${this.agent.id} stream error: ${err instanceof Error ? err.message : err}${_cause ? ` cause=${_cause.code ?? _cause.message ?? JSON.stringify(_cause)}` : ''} · retry in ${backoff}ms`)
       }
+      this.streamLastSeenAt = null
+      if (this.streamAbort === abort) this.streamAbort = null
       if (this.stopped) break
       // BOTH exits back off. Reset the ladder only after a connection that
       // actually stayed up — a 200 that closes immediately must not reset it, or
